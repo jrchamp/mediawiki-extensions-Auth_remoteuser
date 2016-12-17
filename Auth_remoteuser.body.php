@@ -1,135 +1,112 @@
 <?php
+/**
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ * http://www.gnu.org/copyleft/gpl.html
+ *
+ * @file
+ */
 
-class Auth_remoteuser extends AuthPlugin {
+use MediaWiki\Session\SessionInfo;
+use MediaWiki\Session\UserInfo;
+
+/**
+ * Session provider for apache/authz authenticated users.
+ *
+ * Class Auth_remoteuser
+ */
+class Auth_remoteuser extends MediaWiki\Session\ImmutableSessionProviderWithCookie {
+
 	/**
-	 * Pretend all users exist.  This is checked by
-	 * authenticateUserData to determine if a user exists in our 'db'.
-	 * By returning true we tell it that it can create a local wiki
-	 * user automatically.
-	 *
-	 * @param $username String: username.
-	 * @return bool
+	 * @param array $params Keys include:
+	 *  - priority: (required) Set the priority
+	 *  - sessionCookieName: Session cookie name. Default is '_AuthRemoteuserSession'.
+	 *  - sessionCookieOptions: Options to pass to WebResponse::setCookie().
 	 */
-	public function userExists( $username ) {
-		return true;
-	}
+	public function __construct( array $params = [] ) {
+		if ( !isset( $params['sessionCookieName'] ) ) {
+			$params['sessionCookieName'] = '_AuthRemoteuserSession';
+		}
+		parent::__construct( $params );
 
-	/**
-	 * Check whether the given name matches REMOTE_USER.
-	 * The name will be normalized to MediaWiki's requirements, so
-	 * lower it and the REMOTE_USER before checking.
-	 *
-	 * @param $username String: username.
-	 * @param $password String: user password.
-	 * @return bool
-	 */
-	public function authenticate( $username, $password ) {
-		global $wgAuthRemoteuserAuthz;
-
-		if ( !$wgAuthRemoteuserAuthz ) {
-			return false;
+		if ( !isset( $params['priority'] ) ) {
+			throw new \InvalidArgumentException( __METHOD__ . ': priority must be specified' );
+		}
+		if ( $params['priority'] < SessionInfo::MIN_PRIORITY ||
+			$params['priority'] > SessionInfo::MAX_PRIORITY
+		) {
+			throw new \InvalidArgumentException( __METHOD__ . ': Invalid priority' );
 		}
 
-		$usertest = $this->getRemoteUsername();
-
-		return ( strtolower( $username ) == strtolower( $usertest ) );
+		$this->priority = $params['priority'];
 	}
 
 	/**
-	 * Modify options in the login template.  This shouldn't be very
-	 * important because no one should really be bothering with the
-	 * login page.
-	 *
-	 * @param $template UserLoginTemplate object.
-	 * @param $type String
+	 * @inheritDoc
 	 */
-	public function modifyUITemplate( &$template, &$type ) {
-		// disable the mail new password box
-		$template->set( 'useemail', false );
-		// disable 'remember me' box
-		$template->set( 'remember', false );
-		$template->set( 'create', false );
-		$template->set( 'domain', false );
-		$template->set( 'usedomain', false );
+	public function provideSessionInfo( WebRequest $request ) {
+		// Have a session ID?
+		$id = $this->getSessionIdFromCookie( $request );
+		// #6 assign a new sessionid if the id is null or if the session is no longer valid
+		if ( ( null === $id ) || ( !MediaWiki\Session\SessionManager::singleton()->getSessionById( $id ) ) ) {
+			$sessionInfo = $this->newSessionForRequest( $request );
+
+			return $sessionInfo;
+		}
+
+		$sessionInfo = new SessionInfo( $this->priority, [
+			'provider' => $this,
+			'id' => $id,
+			'persisted' => true
+		] );
+
+		return $sessionInfo;
 	}
 
 	/**
-	 * Return true because the wiki should create a new local account
-	 * automatically when asked to login a user who doesn't exist
-	 * locally but does in the external auth database.
-	 *
-	 * @return bool
+	 * @inheritDoc
 	 */
-	public function autoCreate() {
-		return true;
+	public function newSessionInfo( $id = null ) {
+		return null;
 	}
 
 	/**
-	 * Do not allow various changes checked for by allowPropChange.
+	 * @param $username
+	 * @param WebRequest $request
+	 * @return SessionInfo
 	 */
-	public function allowRealNameChange() {
-		return false;
-	}
-	public function allowEmailChange() {
-		return false;
-	}
+	protected function newSessionForRequest( WebRequest $request ) {
+		$id = $this->getSessionIdFromCookie( $request );
 
-	/**
-	 * Of course not here
-	 *
-	 * @return bool
-	 */
-	public function allowPasswordChange() {
-		return false;
-	}
+		$username = $this->getRemoteUsername();
+		$user = User::newFromName( $username, 'usable' );
+		if ( !$user ) {
+			throw new \InvalidArgumentException( 'Invalid user name' );
+		}
 
-	/**
-	 * MediaWiki should never see passwords, but if it does, don't store them.
-	 *
-	 * @return bool
-	 */
-	public function allowSetLocalPassword() {
-		return false;
-	}
+		$this->initUser( $user, $username );
 
-	/**
-	 * This should not be called because we do not allow password
-	 * change.  Always fail by returning false.
-	 *
-	 * @param $user User object.
-	 * @param $password String: password.
-	 * @return bool
-	 */
-	public function setPassword( $user, $password ) {
-		return false;
-	}
+		$info = new SessionInfo( SessionInfo::MAX_PRIORITY, [
+			'provider' => $this,
+			'id' => $id,
+			'userInfo' => UserInfo::newFromUser( $user, true ),
+			'persisted' => false
+		] );
+		$session = $this->getManager()->getSessionFromInfo( $info, $request );
+		$session->persist();
 
-	/**
-	 * We don't support this but we have to return true for
-	 * preferences to save.
-	 *
-	 * @param $user User object.
-	 * @return bool
-	 */
-	public function updateExternalDB( $user ) {
-		return true;
-	}
-
-	/**
-	 * Should never be called, but return false anyway.
-	 */
-	public function addUser( $user, $password, $email = '', $realname = '' ) {
-		return false;
-	}
-
-	/**
-	 * Return true to prevent logins that don't authenticate here from
-	 * being checked against the local database's password fields.
-	 *
-	 * @return bool
-	 */
-	public function strict() {
-		return true;
+		return $info;
 	}
 
 	/**
@@ -140,10 +117,16 @@ class Auth_remoteuser extends AuthPlugin {
 	 * @param $user User object.
 	 * @param $autocreate bool
 	 */
-	public function initUser( &$user, $autocreate = false ) {
-		$username = $this->getRemoteUsername();
+	protected function initUser( &$user, $username ) {
 		if ( Hooks::run( "AuthRemoteUserInitUser",
-				array( $user, $autocreate ) ) ) {
+			[ $user, true ] )
+		) {
+			// Check if above hook or some other effect (e.g.: https://phabricator.wikimedia.org/T95839 )
+			// already created a user in the db. If so, reuse that one.
+			$userFromDb = $user->getInstanceForUpdate();
+			if ( null !== $userFromDb ) {
+				$user = $user->getInstanceForUpdate();
+			}
 
 			$this->setRealName( $user );
 
@@ -154,45 +137,8 @@ class Auth_remoteuser extends AuthPlugin {
 
 			$this->setNotifications( $user );
 		}
+
 		$user->saveSettings();
-	}
-
-	/**
-	 * Normalize user names to the MediaWiki standard to prevent
-	 * duplicate accounts.
-	 *
-	 * @param $username String: username.
-	 * @return string
-	 */
-	public function getCanonicalName( $username ) {
-		// lowercase the username
-		$username = strtolower( $username );
-		// uppercase first letter to make MediaWiki happy
-		return ucfirst( $username );
-	}
-
-	/**
-	 * Extension setup hook.  Run for each request.
-	 */
-	public function setupExtensionForRequest() {
-		// See if we're even needed
-		if ( $this->skipPage() ) {
-			return;
-		}
-
-		$username = $this->getRemoteUsername();
-		// Process the username only if required
-		if ( !$username ) {
-			return;
-		}
-
-		// Check for valid session
-		$user = $this->getUserFromSession( $username );
-		if( $user === true ) {
-			return;
-		}
-
-		$this->handleLogin( $user, $username );
 	}
 
 	/**
@@ -200,7 +146,7 @@ class Auth_remoteuser extends AuthPlugin {
 	 *
 	 * @param User
 	 */
-	public function setRealName( User $user ) {
+	protected function setRealName( User $user ) {
 		global $wgAuthRemoteuserName;
 
 		if ( $wgAuthRemoteuserName ) {
@@ -211,12 +157,37 @@ class Auth_remoteuser extends AuthPlugin {
 	}
 
 	/**
+	 * Return the username to be used.  Empty string if none.
+	 *
+	 * @return string
+	 */
+	protected function getRemoteUsername() {
+		global $wgAuthRemoteuserEnvVariable;
+		global $wgAuthRemoteuserDomain;
+
+		if ( isset( $_SERVER[$wgAuthRemoteuserEnvVariable] ) ) {
+			$username = $_SERVER[$wgAuthRemoteuserEnvVariable];
+
+			if ( $wgAuthRemoteuserDomain ) {
+				$username = str_replace( "$wgAuthRemoteuserDomain\\",
+					"", $username );
+				$username = str_replace( "@$wgAuthRemoteuserDomain",
+					"", $username );
+			}
+		} else {
+			$username = "";
+		}
+
+		return $username;
+	}
+
+	/**
 	 * Sets the email address of the user.
 	 *
 	 * @param User
 	 * @param String username
 	 */
-	public function setEmail( User $user, $username ) {
+	protected function setEmail( User $user, $username ) {
 		global $wgAuthRemoteuserMail, $wgAuthRemoteuserMailDomain;
 
 		if ( $wgAuthRemoteuserMail ) {
@@ -234,7 +205,7 @@ class Auth_remoteuser extends AuthPlugin {
 	 *
 	 * @param User
 	 */
-	public function setNotifications( User $user ) {
+	protected function setNotifications( User $user ) {
 		global $wgAuthRemoteuserNotify;
 
 		// turn on e-mail notifications
@@ -244,137 +215,5 @@ class Auth_remoteuser extends AuthPlugin {
 			$user->setOption( 'enotifminoredits', 1 );
 			$user->setOption( 'enotifrevealaddr', 1 );
 		}
-	}
-
-	/**
-	 * Check if we're needed.
-	 *
-	 * @return bool true if this page should be skipped.
-	 */
-	public function skipPage() {
-		global $wgRequest;
-
-		$title = $wgRequest->getVal( 'title' );
-		if ( ( $title == Title::makeName( NS_SPECIAL, 'UserLogout' ) ) ||
-			( $title == Title::makeName( NS_SPECIAL, 'UserLogin' ) ) ) {
-			return true;
-		}
-	}
-
-	/**
-	 * Return the username to be used.  Empty string if none.
-	 *
-	 * @return string
-	 */
-	public function getRemoteUsername( ) {
-		global $wgAuthRemoteuserDomain;
-
-		if ( isset( $_SERVER['REMOTE_USER'] ) ) {
-			$username = $_SERVER['REMOTE_USER'];
-
-			if ( $wgAuthRemoteuserDomain ) {
-				$username = str_replace( "$wgAuthRemoteuserDomain\\",
-					"", $username );
-				$username = str_replace( "@$wgAuthRemoteuserDomain",
-					"", $username );
-			}
-		} else {
-			$username = "";
-		}
-
-		return $username;
-	}
-
-	/**
-	 * Load the user from session
-	 * @return mixed true if user is already logged in and no further action is needed.
-	 *               User object if this user needs to be logged in
-	 */
-	public function getUserFromSession( $username ) {
-		global $wgUser;
-		$this->setupSession();
-
-		$wgUser = User::newFromSession();
-		if ( !$wgUser->isAnon() ) {
-			if ( $wgUser->getName() ==
-				$this->getCanonicalName( $username ) ) {
-				return true; // User is already logged in.
-			} else {
-				$wgUser->doLogout(); // Logout mismatched user.
-			}
-		}
-		return $wgUser;
-	}
-
-	public function setupSession() {
-		if ( session_id() == '' ) {
-			wfSetupSession();
-		}
-	}
-
-	public function handleLogin( User $user, $username ) {
-		// If the login form returns NEED_TOKEN try once more with the
-		// right token
-		$trycount = 0;
-		$token = '';
-		$errormessage = '';
-		do {
-			$tryagain = false;
-			// Submit a fake login form to authenticate the user.
-			$params = new FauxRequest( array(
-					'wpName' => $username,
-					'wpPassword' => '',
-					'wpDomain' => '',
-					'wpLoginToken' => $token,
-					'wpRemember' => ''
-				) );
-
-			// Authenticate user data will automatically create
-			// new users.
-			$loginForm = new LoginForm( $params );
-			$result = $loginForm->authenticateUserData();
-			switch ( $result ) {
-				case LoginForm :: SUCCESS :
-					$user->setOption( 'rememberpassword', 1 );
-					$user->setCookies();
-					break;
-				case LoginForm :: NEED_TOKEN:
-					$token = $loginForm->getLoginToken();
-					$tryagain = ( $trycount == 0 );
-					break;
-				case LoginForm :: WRONG_TOKEN:
-					$errormessage = 'WrongToken';
-					break;
-				case LoginForm :: NO_NAME :
-					$errormessage = 'NoName';
-					break;
-				case LoginForm :: ILLEGAL :
-					$errormessage = 'Illegal';
-					break;
-				case LoginForm :: WRONG_PLUGIN_PASS :
-					$errormessage = 'WrongPluginPass';
-					break;
-				case LoginForm :: NOT_EXISTS :
-					$errormessage = 'NotExists';
-					break;
-				case LoginForm :: WRONG_PASS :
-					$errormessage = 'WrongPass';
-					break;
-				case LoginForm :: EMPTY_PASS :
-					$errormessage = 'EmptyPass';
-					break;
-				default:
-					$errormessage = 'Unknown';
-					break;
-			}
-
-			if ( $result != LoginForm::SUCCESS
-				&& $result != LoginForm::NEED_TOKEN ) {
-				error_log( 'Unexpected REMOTE_USER authentication'.
-					' failure. Login Error was:' .
-					$errormessage );
-			}
-			$trycount++;
-		} while ( $tryagain );
 	}
 }
